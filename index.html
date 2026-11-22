@@ -35,20 +35,14 @@
   #status { font-size: 11px; color: #666; margin-top: 10px; border-top: 1px solid #eee; padding-top: 6px; }
   .muted { color: #777; font-size: 12px; }
   .warn { color: #b00020; }
-  #hint {
-    position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%);
-    z-index: 2; background: rgba(0,0,0,.72); color: #fff; padding: 6px 14px;
-    border-radius: 14px; font-size: 13px; pointer-events: none; display: none;
-  }
 </style>
 </head>
 <body>
 <div id="map"></div>
-<div id="hint">Zoom in to see land parcels</div>
 <div id="panel">
   <h1>UP Khasra / Gata Finder</h1>
-  <div class="muted">Click a parcel on the map, or enter coordinates:</div>
-  <input id="coords" placeholder="lat, lon   e.g. 25.3176, 82.9739" />
+  <div class="muted">Click anywhere on the map, or enter coordinates:</div>
+  <input id="coords" placeholder="lat, lon   e.g. 25.2546, 82.9578" />
   <div class="btn-row">
     <button id="go">Find Khasra</button>
     <button id="locate">Detect location</button>
@@ -62,34 +56,41 @@ import Pbf from 'https://esm.sh/pbf@3.2.1';
 import { VectorTile } from 'https://esm.sh/@mapbox/vector-tile@1.3.1';
 
 // ---------------------------------------------------------------------------
-// Config
+// Config  (values verified by probing the tile server - see README)
 // ---------------------------------------------------------------------------
-const TILE_URL = 'https://indianopenmaps.com/not-so-open/cadastrals/uttar-pradesh/ncog/{z}/{x}/{y}.pbf';
+const TILE_BASE = 'https://indianopenmaps.com/not-so-open/cadastrals/uttar-pradesh/ncog';
+const TILE_URL  = TILE_BASE + '/{z}/{x}/{y}.pbf';
 const UP_BOUNDS = [[77.0, 23.8], [84.7, 30.5]];
 
-// VERIFIED by probing the server: tiles exist up to z14 only. z15+ returns 404.
-// Telling the source maxzoom:14 makes MapLibre stop requesting non-existent
-// tiles and instead OVERZOOM the z14 data (re-render it scaled) at z15-z18.
-const TILE_MAXZOOM = 14;
-const MAP_MAXZOOM  = 18;   // user can zoom to ~50 m scale
+const TILE_MINZOOM = 5;    // tiles exist from z5 ...
+const TILE_MAXZOOM = 14;   // ... up to z14. z15+ is 404 everywhere.
+const MAP_MAXZOOM  = 18;   // overzoomed past z14 so parcels stay visible
 const GOTO_ZOOM    = 16;   // where coordinate search / detect-location lands
-const PROBE_ZOOM   = 12;
-const PARCEL_MINZOOM = 11;  // below this, parcels are sub-pixel and tiles are huge   // zoom used to sniff the tile schema
+const PROBE_ZOOM   = 12;   // zoom used to sniff the tile schema
 
-// Several probe points, since coverage is partial (~34 districts)
 const PROBE_POINTS = [
   [82.9739, 25.3176], [80.9462, 26.8467], [81.8463, 25.4358], [83.3732, 26.7606],
   [79.4304, 28.3670], [80.3319, 26.4499], [77.7064, 29.4727], [78.0081, 27.1767],
 ];
 const KHASRA_RE = /^khasra$|khasra|khsra|gata|gat_?no|kh_?no/i;
-// Fields shown as a readable place line, in order
+// block_name holds junk in places ("ROAD", "KHASRA"), so it stays out of this line
 const PLACE_FIELDS = ['village', 'pargana', 'tahsil', 'district'];
 
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
 const setStatus = (t, cls) => { statusEl.textContent = t; statusEl.className = cls || ''; };
 
-function lonLatToTile(lon, lat, z) {
+let cadLayer = null;   // vector-tile layer name, discovered at startup
+let khasraKey = null;
+let marker = null;
+let lookupSeq = 0;     // guards against out-of-order async lookups
+
+// ---------------------------------------------------------------------------
+// Tile maths + direct tile lookup
+// This path reads the vector tile itself, so a coordinate can be resolved even
+// when nothing is drawn on screen (zoomed out, or tiles not yet rendered).
+// ---------------------------------------------------------------------------
+function tileOf(lon, lat, z) {
   const n = 2 ** z;
   const x = Math.floor((lon + 180) / 360 * n);
   const r = lat * Math.PI / 180;
@@ -97,34 +98,62 @@ function lonLatToTile(lon, lat, z) {
   return { x, y };
 }
 
-// Sniff a real tile to learn the layer name + attribute names
-async function discoverSchema() {
-  for (const [lon, lat] of PROBE_POINTS) {
-    const { x, y } = lonLatToTile(lon, lat, PROBE_ZOOM);
-    const url = TILE_URL.replace('{z}', PROBE_ZOOM).replace('{x}', x).replace('{y}', y);
-    try {
-      const res = await fetch(url);
-      if (!res.ok) continue;
+const tileCache = new Map();           // "z/x/y" -> VectorTile | null
+async function getTile(z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  if (tileCache.has(key)) return tileCache.get(key);
+  let vt = null;
+  try {
+    const res = await fetch(`${TILE_BASE}/${key}.pbf`);
+    if (res.ok) {
       const buf = await res.arrayBuffer();
-      if (!buf.byteLength) continue;
-      const vt = new VectorTile(new Pbf(new Uint8Array(buf)));
-      for (const name of Object.keys(vt.layers)) {
-        const layer = vt.layers[name];
-        if (!layer.length) continue;
-        const keys = new Set();
-        for (let i = 0; i < Math.min(layer.length, 30); i++) {
-          Object.keys(layer.feature(i).properties).forEach(k => keys.add(k));
-        }
-        return { layer: name, keys: [...keys] };
-      }
-    } catch (e) {
-      console.warn('Probe failed', url, e);
-      if (e instanceof TypeError) {
-        throw new Error('Tile request blocked (CORS / network). See browser console.');
-      }
+      if (buf.byteLength) vt = new VectorTile(new Pbf(new Uint8Array(buf)));
+    }
+  } catch (e) { console.warn('tile fetch failed', key, e); }
+  if (tileCache.size > 400) tileCache.clear();
+  tileCache.set(key, vt);
+  return vt;
+}
+
+function pointInRing(pt, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if (((yi > pt[1]) !== (yj > pt[1])) &&
+        (pt[0] < (xj - xi) * (pt[1] - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function pointInGeometry(pt, coords, type) {
+  const polys = type === 'Polygon' ? [coords] : coords;
+  for (const poly of polys) {
+    if (pointInRing(pt, poly[0])) {
+      let inHole = false;
+      for (let k = 1; k < poly.length; k++) if (pointInRing(pt, poly[k])) inHole = true;
+      if (!inHole) return true;
     }
   }
-  throw new Error('No features found in sample tiles.');
+  return false;
+}
+
+// Walk down from the most detailed zoom until a tile exists for this point.
+async function findParcelInTiles(lon, lat) {
+  for (let z = TILE_MAXZOOM; z >= 10; z--) {
+    const { x, y } = tileOf(lon, lat, z);
+    const vt = await getTile(z, x, y);
+    if (!vt) continue;                       // no tile at this zoom, try coarser
+    const layer = vt.layers[cadLayer];
+    if (!layer || !layer.length) continue;
+    for (let i = 0; i < layer.length; i++) {
+      const gj = layer.feature(i).toGeoJSON(x, y, z);
+      if (gj.geometry && pointInGeometry([lon, lat], gj.geometry.coordinates, gj.geometry.type)) {
+        return { feature: gj, covered: true };
+      }
+    }
+    // A tile exists here, so the area is mapped - the point just isn't on a parcel.
+    return { feature: null, covered: true };
+  }
+  return { feature: null, covered: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +163,9 @@ const map = new maplibregl.Map({
   container: 'map',
   style: {
     version: 8,
+    // NOTE: demotiles.maplibre.org/font/... 404s. A failing glyph fetch makes
+    // MapLibre drop EVERY bucket for a tile, so parcels vanish along with the
+    // labels. Keep a font endpoint that actually resolves.
     glyphs: 'https://fonts.openmaptiles.org/{fontstack}/{range}.pbf',
     sources: {
       osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
@@ -149,7 +181,7 @@ const map = new maplibregl.Map({
   bounds: UP_BOUNDS,
   maxZoom: MAP_MAXZOOM,
 });
-window.map = map;   // handy for debugging in the console
+window.map = map;   // handy in the browser console
 
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
 map.addControl(new maplibregl.ScaleControl(), 'bottom-left');
@@ -171,25 +203,27 @@ class BaseToggle {
 }
 map.addControl(new BaseToggle(), 'top-right');
 
-let khasraKey = null;
-let marker = null;
-
-function showFeature(f, lngLat) {
+// ---------------------------------------------------------------------------
+// Result panel
+// ---------------------------------------------------------------------------
+function showFeature(f, lngLat, covered) {
   const coordLine = `<div class="muted">${lngLat.lat.toFixed(6)}, ${lngLat.lng.toFixed(6)}</div>`;
   if (!f) {
-    const z = map.getZoom().toFixed(1);
+    const why = covered
+      ? `No parcel is recorded at this exact point — it may be a road, river or
+         built-up area. Try clicking just inside a plot.`
+      : `This area isn't in the dataset at all — coverage is partial
+         (~34 districts).`;
     resultEl.innerHTML = coordLine +
       `<div class="warn" style="margin-top:6px">No parcel here.</div>
-       <div class="muted">Either this area isn't in the dataset (only ~34 districts
-       are covered), or the tiles haven't finished loading. Current zoom ${z}.</div>`;
+       <div class="muted">${why}</div>`;
     map.getSource('selected')?.setData({ type: 'FeatureCollection', features: [] });
     return;
   }
   const p = f.properties;
   const kh = khasraKey ? p[khasraKey] : null;
   const place = PLACE_FIELDS.map(k => p[k]).filter(Boolean).join(' · ');
-  const rows = Object.entries(p)
-    .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  const rows = Object.entries(p).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
 
   resultEl.innerHTML = coordLine + `
     <div class="khasra-box">
@@ -205,26 +239,60 @@ function showFeature(f, lngLat) {
   });
 }
 
-function lookupAt(lngLat) {
+// Drop a marker and resolve the parcel, whatever the current zoom.
+async function lookupAt(lngLat) {
   lngLat = maplibregl.LngLat.convert(lngLat);
+  const seq = ++lookupSeq;
+
   if (marker) marker.remove();
   marker = new maplibregl.Marker({ color: '#b00020' }).setLngLat(lngLat).addTo(map);
-  if (!map.getLayer('parcel-fill')) return;
+
+  // Fast path: an exact hit on a drawn parcel. Only trusted when the point is
+  // on screen AND we are zoomed in far enough for a pixel to be small - at low
+  // zoom a few pixels span kilometres, so a "near" hit would be the wrong plot.
+  const cv = map.getCanvas();
   const pt = map.project(lngLat);
-  // Exact hit first; fall back to a small box for near-misses on parcel edges
-  let feats = map.queryRenderedFeatures(pt, { layers: ['parcel-fill'] });
-  if (!feats.length) {
-    const r = 6;
-    feats = map.queryRenderedFeatures(
-      [[pt.x - r, pt.y - r], [pt.x + r, pt.y + r]], { layers: ['parcel-fill'] });
+  const onScreen = pt.x >= 0 && pt.y >= 0 &&
+                   pt.x <= cv.clientWidth && pt.y <= cv.clientHeight;
+  if (onScreen && map.getZoom() >= TILE_MAXZOOM && map.getLayer('parcel-fill')) {
+    const hits = map.queryRenderedFeatures(pt, { layers: ['parcel-fill'] });
+    if (hits.length) { showFeature(hits[0], lngLat, true); return; }
   }
-  showFeature(feats[0], lngLat);
+
+  // Slow path: read the vector tile directly. Works zoomed out, or before
+  // tiles have rendered.
+  resultEl.innerHTML = `<div class="muted">${lngLat.lat.toFixed(6)}, ${lngLat.lng.toFixed(6)}<br>Looking up parcel…</div>`;
+  let res = { feature: null, covered: false };
+  try { res = await findParcelInTiles(lngLat.lng, lngLat.lat); }
+  catch (e) { console.warn('tile lookup failed', e); }
+  if (seq !== lookupSeq) return;          // a newer click superseded this one
+  showFeature(res.feature, lngLat, res.covered);
 }
 
 function goToAndLookup(lat, lon) {
-  resultEl.innerHTML = '<div class="muted">Searching…</div>';
-  map.once('idle', () => lookupAt({ lng: lon, lat }));
   map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), GOTO_ZOOM) });
+  lookupAt({ lng: lon, lat });            // independent of the flight finishing
+}
+
+// ---------------------------------------------------------------------------
+// Layers
+// ---------------------------------------------------------------------------
+async function discoverSchema() {
+  for (const [lon, lat] of PROBE_POINTS) {
+    const { x, y } = tileOf(lon, lat, PROBE_ZOOM);
+    const vt = await getTile(PROBE_ZOOM, x, y);
+    if (!vt) continue;
+    for (const name of Object.keys(vt.layers)) {
+      const layer = vt.layers[name];
+      if (!layer.length) continue;
+      const keys = new Set();
+      for (let i = 0; i < Math.min(layer.length, 30); i++) {
+        Object.keys(layer.feature(i).properties).forEach(k => keys.add(k));
+      }
+      return { layer: name, keys: [...keys] };
+    }
+  }
+  throw new Error('No features found in sample tiles (CORS or network?).');
 }
 
 map.on('load', async () => {
@@ -236,41 +304,50 @@ map.on('load', async () => {
     setStatus('⚠ ' + e.message, 'warn');
     return;
   }
+  cadLayer = schema.layer;
   khasraKey = schema.keys.find(k => KHASRA_RE.test(k)) || null;
   console.log('Tile schema:', schema, 'khasra field:', khasraKey);
-  setStatus(`Layer "${schema.layer}" · khasra field: ${khasraKey || '(not detected)'} · `
-          + `tiles to z${TILE_MAXZOOM}, overzoomed beyond`);
+  setStatus(`Layer "${cadLayer}" · khasra field: ${khasraKey || '(not detected)'} · `
+          + `tiles z${TILE_MINZOOM}–z${TILE_MAXZOOM}, overzoomed beyond`);
 
-  // maxzoom = highest zoom the server HAS. MapLibre overzooms past it.
   map.addSource('cad', {
     type: 'vector',
     tiles: [TILE_URL],
-    minzoom: PARCEL_MINZOOM,
+    minzoom: TILE_MINZOOM,
     maxzoom: TILE_MAXZOOM,
     attribution: 'Cadastrals: indianopenmaps.com / NCOG',
   });
 
-  // No maxzoom on any layer — they must keep drawing at z15-z18.
+  // Zoomed out the fill is what shows which regions are covered; zoomed in it
+  // steps back so the outlines read clearly. No maxzoom on any layer.
   map.addLayer({
-    id: 'parcel-fill', type: 'fill', source: 'cad', 'source-layer': schema.layer,
-    paint: { 'fill-color': '#ffcc00', 'fill-opacity': 0.08 },
+    id: 'parcel-fill', type: 'fill', source: 'cad', 'source-layer': cadLayer,
+    paint: {
+      // Zoomed out these patches are the coverage map, so they are strong and
+      // saturated; zoomed in they fade so the outlines and labels dominate.
+      'fill-color': ['interpolate', ['linear'], ['zoom'],
+                     5, '#d84315', 10, '#f57c00', 13, '#ffcc00'],
+      'fill-opacity': ['interpolate', ['linear'], ['zoom'],
+                       5, 0.9, 9, 0.8, 11, 0.45, 13, 0.15, 14, 0.08],
+    },
   });
   map.addLayer({
-    id: 'parcel-line', type: 'line', source: 'cad', 'source-layer': schema.layer,
+    id: 'parcel-line', type: 'line', source: 'cad', 'source-layer': cadLayer,
     paint: {
       'line-color': '#e65100',
+      // hidden when zoomed right out, where 20k outlines would just be a smear
+      'line-opacity': ['interpolate', ['linear'], ['zoom'], 9, 0, 11, 1],
       'line-width': ['interpolate', ['linear'], ['zoom'], 11, 0.3, 14, 1.2, 18, 2.5],
     },
   });
   if (khasraKey) {
     map.addLayer({
-      id: 'parcel-label', type: 'symbol', source: 'cad', 'source-layer': schema.layer,
+      id: 'parcel-label', type: 'symbol', source: 'cad', 'source-layer': cadLayer,
       minzoom: 14,
       layout: {
         'text-field': ['to-string', ['get', khasraKey]],
         'text-font': ['Open Sans Regular'],
         'text-size': ['interpolate', ['linear'], ['zoom'], 14, 9, 16, 12, 18, 15],
-        'text-allow-overlap': false,
       },
       paint: { 'text-color': '#1a1a1a', 'text-halo-color': '#fff', 'text-halo-width': 1.4 },
     });
@@ -281,13 +358,6 @@ map.on('load', async () => {
     id: 'selected-line', type: 'line', source: 'selected',
     paint: { 'line-color': '#b00020', 'line-width': 3 },
   });
-
-  const hint = document.getElementById('hint');
-  const syncHint = () => {
-    hint.style.display = map.getZoom() < PARCEL_MINZOOM ? 'block' : 'none';
-  };
-  map.on('zoom', syncHint);
-  syncHint();
 
   map.on('click', (e) => lookupAt(e.lngLat));
   map.on('mouseenter', 'parcel-fill', () => map.getCanvas().style.cursor = 'pointer');
@@ -305,7 +375,7 @@ document.getElementById('go').onclick = () => {
     return;
   }
   let [lat, lon] = nums;
-  if (Math.abs(lat) > 40 && Math.abs(lon) < 40) [lat, lon] = [lon, lat]; // lon,lat given
+  if (Math.abs(lat) > 40 && Math.abs(lon) < 40) [lat, lon] = [lon, lat];
   goToAndLookup(lat, lon);
 };
 document.getElementById('coords').addEventListener('keydown', e => {
