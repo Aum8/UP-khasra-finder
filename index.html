@@ -10,28 +10,49 @@
   html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
   #map { position: absolute; inset: 0; }
   #panel {
-    position: absolute; top: 10px; left: 10px; z-index: 2; width: 320px;
+    position: absolute; top: 10px; left: 10px; z-index: 2; width: 330px;
+    max-height: calc(100vh - 20px); overflow: auto;
     background: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.25);
     padding: 12px; font-size: 14px;
   }
   #panel h1 { font-size: 16px; margin: 0 0 8px; }
   #panel input { width: 100%; box-sizing: border-box; padding: 6px; margin: 4px 0; }
-  #panel button { padding: 6px 10px; margin-top: 4px; cursor: pointer; }
-  #result { margin-top: 10px; max-height: 40vh; overflow: auto; }
-  #result table { border-collapse: collapse; width: 100%; font-size: 12px; }
-  #result td { border-top: 1px solid #eee; padding: 3px 4px; vertical-align: top; word-break: break-word; }
-  .khasra { font-size: 22px; font-weight: 700; color: #b00020; }
-  #status { font-size: 12px; color: #555; margin-top: 8px; }
+  .btn-row { display: flex; gap: 6px; margin-top: 4px; }
+  .btn-row button { flex: 1; padding: 7px 10px; cursor: pointer; border-radius: 4px; font-size: 13px; }
+  #locate { background: #1565c0; color: #fff; border: 1px solid #1565c0; }
+  #locate:disabled { opacity: .55; cursor: default; }
+  #go { background: #fff; border: 1px solid #aaa; }
+  #result { margin-top: 10px; }
+  .khasra-box { background: #fff8e1; border: 1px solid #ffd54f; border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+  .khasra-lbl { font-size: 11px; color: #777; text-transform: uppercase; letter-spacing: .5px; }
+  .khasra { font-size: 26px; font-weight: 700; color: #b00020; line-height: 1.1; }
+  .place { font-size: 13px; color: #333; margin-top: 4px; }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; font-size: 12px; color: #1565c0; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 6px; }
+  td { border-top: 1px solid #eee; padding: 3px 4px; vertical-align: top; word-break: break-word; }
+  td:first-child { color: #666; white-space: nowrap; }
+  #status { font-size: 11px; color: #666; margin-top: 10px; border-top: 1px solid #eee; padding-top: 6px; }
   .muted { color: #777; font-size: 12px; }
+  .warn { color: #b00020; }
+  #hint {
+    position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%);
+    z-index: 2; background: rgba(0,0,0,.72); color: #fff; padding: 6px 14px;
+    border-radius: 14px; font-size: 13px; pointer-events: none; display: none;
+  }
 </style>
 </head>
 <body>
 <div id="map"></div>
+<div id="hint">Zoom in to see land parcels</div>
 <div id="panel">
   <h1>UP Khasra / Gata Finder</h1>
   <div class="muted">Click a parcel on the map, or enter coordinates:</div>
-  <input id="coords" placeholder="lat, lon  e.g. 26.8467, 80.9462" />
-  <button id="go">Find Khasra</button>
+  <input id="coords" placeholder="lat, lon   e.g. 25.3176, 82.9739" />
+  <div class="btn-row">
+    <button id="go">Find Khasra</button>
+    <button id="locate">Detect location</button>
+  </div>
   <div id="result"></div>
   <div id="status">Loading…</div>
 </div>
@@ -40,22 +61,33 @@
 import Pbf from 'https://esm.sh/pbf@3.2.1';
 import { VectorTile } from 'https://esm.sh/@mapbox/vector-tile@1.3.1';
 
-// ---- Config ----
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 const TILE_URL = 'https://indianopenmaps.com/not-so-open/cadastrals/uttar-pradesh/ncog/{z}/{x}/{y}.pbf';
 const UP_BOUNDS = [[77.0, 23.8], [84.7, 30.5]];
-const TILE_MAXZOOM = 15;          // server's max zoom guess; MapLibre overzooms beyond this
-const PROBE_ZOOM = 14;
-// Places used to sniff a tile for layer/field names (several, as coverage is partial)
+
+// VERIFIED by probing the server: tiles exist up to z14 only. z15+ returns 404.
+// Telling the source maxzoom:14 makes MapLibre stop requesting non-existent
+// tiles and instead OVERZOOM the z14 data (re-render it scaled) at z15-z18.
+const TILE_MAXZOOM = 14;
+const MAP_MAXZOOM  = 18;   // user can zoom to ~50 m scale
+const GOTO_ZOOM    = 16;   // where coordinate search / detect-location lands
+const PROBE_ZOOM   = 12;
+const PARCEL_MINZOOM = 11;  // below this, parcels are sub-pixel and tiles are huge   // zoom used to sniff the tile schema
+
+// Several probe points, since coverage is partial (~34 districts)
 const PROBE_POINTS = [
-  [80.9462, 26.8467], [82.9739, 25.3176], [78.0081, 27.1767], [81.8463, 25.4358],
-  [77.7064, 29.4727], [83.3732, 26.7606], [79.4304, 28.3670], [80.3319, 26.4499],
+  [82.9739, 25.3176], [80.9462, 26.8467], [81.8463, 25.4358], [83.3732, 26.7606],
+  [79.4304, 28.3670], [80.3319, 26.4499], [77.7064, 29.4727], [78.0081, 27.1767],
 ];
-// Field names that likely hold the Khasra / Gata number (first match wins)
-const KHASRA_RE = /khasra|khsra|gata|kide|plot|survey|kh_?no|parcel|gat_?no/i;
+const KHASRA_RE = /^khasra$|khasra|khsra|gata|gat_?no|kh_?no/i;
+// Fields shown as a readable place line, in order
+const PLACE_FIELDS = ['village', 'pargana', 'tahsil', 'district'];
 
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
-const setStatus = (t) => statusEl.textContent = t;
+const setStatus = (t, cls) => { statusEl.textContent = t; statusEl.className = cls || ''; };
 
 function lonLatToTile(lon, lat, z) {
   const n = 2 ** z;
@@ -65,7 +97,7 @@ function lonLatToTile(lon, lat, z) {
   return { x, y };
 }
 
-// Download sample tiles until one has features; return layer names + property keys
+// Sniff a real tile to learn the layer name + attribute names
 async function discoverSchema() {
   for (const [lon, lat] of PROBE_POINTS) {
     const { x, y } = lonLatToTile(lon, lat, PROBE_ZOOM);
@@ -76,32 +108,36 @@ async function discoverSchema() {
       const buf = await res.arrayBuffer();
       if (!buf.byteLength) continue;
       const vt = new VectorTile(new Pbf(new Uint8Array(buf)));
-      const layers = Object.keys(vt.layers);
-      for (const name of layers) {
+      for (const name of Object.keys(vt.layers)) {
         const layer = vt.layers[name];
         if (!layer.length) continue;
         const keys = new Set();
-        for (let i = 0; i < Math.min(layer.length, 20); i++) {
+        for (let i = 0; i < Math.min(layer.length, 30); i++) {
           Object.keys(layer.feature(i).properties).forEach(k => keys.add(k));
         }
-        return { layers, layer: name, keys: [...keys], sample: layer.feature(0).properties };
+        return { layer: name, keys: [...keys] };
       }
     } catch (e) {
       console.warn('Probe failed', url, e);
-      if (e instanceof TypeError) throw new Error('Tile request blocked (likely CORS / network). See console.');
+      if (e instanceof TypeError) {
+        throw new Error('Tile request blocked (CORS / network). See browser console.');
+      }
     }
   }
   throw new Error('No features found in sample tiles.');
 }
 
+// ---------------------------------------------------------------------------
+// Map
+// ---------------------------------------------------------------------------
 const map = new maplibregl.Map({
   container: 'map',
   style: {
     version: 8,
-    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+    glyphs: 'https://fonts.openmaptiles.org/{fontstack}/{range}.pbf',
     sources: {
-      osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256,
-             maxzoom: 19, attribution: '© OpenStreetMap contributors' },
+      osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+             tileSize: 256, maxzoom: 19, attribution: '© OpenStreetMap contributors' },
       sat: { type: 'raster', tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
              tileSize: 256, maxzoom: 19, attribution: 'Imagery © Esri' },
     },
@@ -111,21 +147,23 @@ const map = new maplibregl.Map({
     ],
   },
   bounds: UP_BOUNDS,
-  maxZoom: 20,
+  maxZoom: MAP_MAXZOOM,
 });
+window.map = map;   // handy for debugging in the console
+
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
 map.addControl(new maplibregl.ScaleControl(), 'bottom-left');
 
-// simple basemap toggle
 class BaseToggle {
   onAdd(m) {
     const b = document.createElement('button');
-    b.textContent = 'Satellite'; b.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    b.style.cssText = 'padding:4px 8px;cursor:pointer;';
+    b.textContent = 'Satellite';
+    b.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    b.style.cssText = 'padding:4px 8px;cursor:pointer;font-size:12px;';
     b.onclick = () => {
-      const sat = m.getLayoutProperty('sat', 'visibility') === 'visible';
-      m.setLayoutProperty('sat', 'visibility', sat ? 'none' : 'visible');
-      b.textContent = sat ? 'Satellite' : 'Street';
+      const on = m.getLayoutProperty('sat', 'visibility') === 'visible';
+      m.setLayoutProperty('sat', 'visibility', on ? 'none' : 'visible');
+      b.textContent = on ? 'Satellite' : 'Street';
     };
     return b;
   }
@@ -137,27 +175,56 @@ let khasraKey = null;
 let marker = null;
 
 function showFeature(f, lngLat) {
+  const coordLine = `<div class="muted">${lngLat.lat.toFixed(6)}, ${lngLat.lng.toFixed(6)}</div>`;
   if (!f) {
-    resultEl.innerHTML = `<div>No parcel found at ${lngLat.lat.toFixed(6)}, ${lngLat.lng.toFixed(6)}.</div>
-      <div class="muted">This area may not be covered (dataset is partial), or tiles haven't loaded yet.</div>`;
+    const z = map.getZoom().toFixed(1);
+    resultEl.innerHTML = coordLine +
+      `<div class="warn" style="margin-top:6px">No parcel here.</div>
+       <div class="muted">Either this area isn't in the dataset (only ~34 districts
+       are covered), or the tiles haven't finished loading. Current zoom ${z}.</div>`;
+    map.getSource('selected')?.setData({ type: 'FeatureCollection', features: [] });
     return;
   }
   const p = f.properties;
   const kh = khasraKey ? p[khasraKey] : null;
-  const rows = Object.entries(p).map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`).join('');
-  resultEl.innerHTML = `
-    <div class="muted">${lngLat.lat.toFixed(6)}, ${lngLat.lng.toFixed(6)}</div>
-    ${kh != null ? `<div>Khasra / Gata: <span class="khasra">${kh}</span></div>` : ''}
-    <table>${rows}</table>`;
-  map.getSource('selected').setData({ type: 'FeatureCollection', features: [{ type: 'Feature', geometry: f.geometry, properties: {} }] });
+  const place = PLACE_FIELDS.map(k => p[k]).filter(Boolean).join(' · ');
+  const rows = Object.entries(p)
+    .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+
+  resultEl.innerHTML = coordLine + `
+    <div class="khasra-box">
+      <div class="khasra-lbl">Khasra / Gata no.</div>
+      <div class="khasra">${kh ?? '—'}</div>
+      ${place ? `<div class="place">${place}</div>` : ''}
+    </div>
+    <details><summary>All attributes</summary><table>${rows}</table></details>`;
+
+  map.getSource('selected').setData({
+    type: 'FeatureCollection',
+    features: [{ type: 'Feature', geometry: f.geometry, properties: {} }],
+  });
 }
 
 function lookupAt(lngLat) {
+  lngLat = maplibregl.LngLat.convert(lngLat);
   if (marker) marker.remove();
   marker = new maplibregl.Marker({ color: '#b00020' }).setLngLat(lngLat).addTo(map);
+  if (!map.getLayer('parcel-fill')) return;
   const pt = map.project(lngLat);
-  const feats = map.queryRenderedFeatures(pt, { layers: ['parcel-fill'] });
-  showFeature(feats[0], maplibregl.LngLat.convert(lngLat));
+  // Exact hit first; fall back to a small box for near-misses on parcel edges
+  let feats = map.queryRenderedFeatures(pt, { layers: ['parcel-fill'] });
+  if (!feats.length) {
+    const r = 6;
+    feats = map.queryRenderedFeatures(
+      [[pt.x - r, pt.y - r], [pt.x + r, pt.y + r]], { layers: ['parcel-fill'] });
+  }
+  showFeature(feats[0], lngLat);
+}
+
+function goToAndLookup(lat, lon) {
+  resultEl.innerHTML = '<div class="muted">Searching…</div>';
+  map.once('idle', () => lookupAt({ lng: lon, lat }));
+  map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), GOTO_ZOOM) });
 }
 
 map.on('load', async () => {
@@ -166,44 +233,116 @@ map.on('load', async () => {
   try {
     schema = await discoverSchema();
   } catch (e) {
-    setStatus('⚠ ' + e.message);
+    setStatus('⚠ ' + e.message, 'warn');
     return;
   }
   khasraKey = schema.keys.find(k => KHASRA_RE.test(k)) || null;
-  console.log('Tile schema:', schema);
-  setStatus(`Layer: "${schema.layer}" · fields: ${schema.keys.join(', ')} · khasra field: ${khasraKey || '(not detected)'}`);
+  console.log('Tile schema:', schema, 'khasra field:', khasraKey);
+  setStatus(`Layer "${schema.layer}" · khasra field: ${khasraKey || '(not detected)'} · `
+          + `tiles to z${TILE_MAXZOOM}, overzoomed beyond`);
 
-  map.addSource('cad', { type: 'vector', tiles: [TILE_URL], maxzoom: TILE_MAXZOOM,
-                         attribution: 'Cadastrals: indianopenmaps / NCOG' });
-  map.addLayer({ id: 'parcel-fill', type: 'fill', source: 'cad', 'source-layer': schema.layer,
-                 paint: { 'fill-color': '#ffcc00', 'fill-opacity': 0.08 } });
-  map.addLayer({ id: 'parcel-line', type: 'line', source: 'cad', 'source-layer': schema.layer,
-                 paint: { 'line-color': '#e65100', 'line-width': ['interpolate', ['linear'], ['zoom'], 12, 0.3, 18, 1.5] } });
+  // maxzoom = highest zoom the server HAS. MapLibre overzooms past it.
+  map.addSource('cad', {
+    type: 'vector',
+    tiles: [TILE_URL],
+    minzoom: PARCEL_MINZOOM,
+    maxzoom: TILE_MAXZOOM,
+    attribution: 'Cadastrals: indianopenmaps.com / NCOG',
+  });
+
+  // No maxzoom on any layer — they must keep drawing at z15-z18.
+  map.addLayer({
+    id: 'parcel-fill', type: 'fill', source: 'cad', 'source-layer': schema.layer,
+    paint: { 'fill-color': '#ffcc00', 'fill-opacity': 0.08 },
+  });
+  map.addLayer({
+    id: 'parcel-line', type: 'line', source: 'cad', 'source-layer': schema.layer,
+    paint: {
+      'line-color': '#e65100',
+      'line-width': ['interpolate', ['linear'], ['zoom'], 11, 0.3, 14, 1.2, 18, 2.5],
+    },
+  });
   if (khasraKey) {
-    map.addLayer({ id: 'parcel-label', type: 'symbol', source: 'cad', 'source-layer': schema.layer, minzoom: 16,
-                   layout: { 'text-field': ['to-string', ['get', khasraKey]], 'text-font': ['Open Sans Regular'],
-                             'text-size': 11 },
-                   paint: { 'text-color': '#222', 'text-halo-color': '#fff', 'text-halo-width': 1.2 } });
+    map.addLayer({
+      id: 'parcel-label', type: 'symbol', source: 'cad', 'source-layer': schema.layer,
+      minzoom: 14,
+      layout: {
+        'text-field': ['to-string', ['get', khasraKey]],
+        'text-font': ['Open Sans Regular'],
+        'text-size': ['interpolate', ['linear'], ['zoom'], 14, 9, 16, 12, 18, 15],
+        'text-allow-overlap': false,
+      },
+      paint: { 'text-color': '#1a1a1a', 'text-halo-color': '#fff', 'text-halo-width': 1.4 },
+    });
   }
+
   map.addSource('selected', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
-  map.addLayer({ id: 'selected-line', type: 'line', source: 'selected', paint: { 'line-color': '#b00020', 'line-width': 3 } });
+  map.addLayer({
+    id: 'selected-line', type: 'line', source: 'selected',
+    paint: { 'line-color': '#b00020', 'line-width': 3 },
+  });
+
+  const hint = document.getElementById('hint');
+  const syncHint = () => {
+    hint.style.display = map.getZoom() < PARCEL_MINZOOM ? 'block' : 'none';
+  };
+  map.on('zoom', syncHint);
+  syncHint();
 
   map.on('click', (e) => lookupAt(e.lngLat));
   map.on('mouseenter', 'parcel-fill', () => map.getCanvas().style.cursor = 'pointer');
   map.on('mouseleave', 'parcel-fill', () => map.getCanvas().style.cursor = '');
 });
 
+// ---------------------------------------------------------------------------
+// Coordinate search
+// ---------------------------------------------------------------------------
 document.getElementById('go').onclick = () => {
-  const m = document.getElementById('coords').value.split(/[ ,]+/).filter(Boolean).map(Number);
-  if (m.length !== 2 || m.some(isNaN)) { alert('Enter as: lat, lon'); return; }
-  let [lat, lon] = m;
-  if (lat > 60 && lon < 40) [lat, lon] = [lon, lat]; // tolerate lon,lat order
-  const lngLat = { lng: lon, lat };
-  resultEl.innerHTML = 'Searching…';
-  map.flyTo({ center: [lon, lat], zoom: 17 });
-  map.once('idle', () => lookupAt(lngLat));
+  const nums = document.getElementById('coords').value
+    .split(/[\s,]+/).filter(Boolean).map(Number);
+  if (nums.length !== 2 || nums.some(isNaN)) {
+    resultEl.innerHTML = '<div class="warn">Enter two numbers as: lat, lon</div>';
+    return;
+  }
+  let [lat, lon] = nums;
+  if (Math.abs(lat) > 40 && Math.abs(lon) < 40) [lat, lon] = [lon, lat]; // lon,lat given
+  goToAndLookup(lat, lon);
 };
-document.getElementById('coords').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('go').click(); });
+document.getElementById('coords').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('go').click();
+});
+
+// ---------------------------------------------------------------------------
+// Detect location — permission is requested only on click
+// ---------------------------------------------------------------------------
+const locBtn = document.getElementById('locate');
+locBtn.onclick = () => {
+  if (!navigator.geolocation) {
+    resultEl.innerHTML = '<div class="warn">This browser has no geolocation support.</div>';
+    return;
+  }
+  locBtn.disabled = true;
+  locBtn.textContent = 'Detecting…';
+  const reset = () => { locBtn.disabled = false; locBtn.textContent = 'Detect location'; };
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const { latitude: lat, longitude: lon } = pos.coords;
+      document.getElementById('coords').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+      reset();
+      goToAndLookup(lat, lon);
+    },
+    (err) => {
+      reset();
+      const msgs = {
+        1: 'Location permission denied. Allow it in the browser and try again.',
+        2: 'Location unavailable — check that location services are on.',
+        3: 'Location request timed out. Try again.',
+      };
+      resultEl.innerHTML = `<div class="warn">${msgs[err.code] || err.message}</div>`;
+    },
+    { enableHighAccuracy: true, timeout: 15000 }
+  );
+};
 </script>
 </body>
 </html>
